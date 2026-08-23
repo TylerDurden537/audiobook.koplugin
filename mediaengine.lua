@@ -1797,6 +1797,13 @@ Seeking is done by skipping bytes when stripping the WAV header.
     (caller should fall back to the bundled gst-play binary)
 --]]
 function MediaEngine:_playSystemGstLaunch(gen)
+    -- Kindle's GStreamer 0.10 build has no pitch-preserving tempo element.
+    -- Route non-unity playback through bundled ffmpeg even for plain WAV so
+    -- its atempo filter can change speed before PCM reaches mixersink.
+    if math.abs((self._playback_speed or 1.0) - 1.0) >= 0.01 then
+        return self:_playSystemGstLaunchFfmpeg(gen)
+    end
+
     local fh = io.open(self.current_path, "rb")
     if not fh then return nil end
     local header = fh:read(44)
@@ -1984,6 +1991,7 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     os.remove(progress_file)
     self._progress_file = progress_file
     self._use_progress_position = true
+    self._last_progress_position = seek
 
     -- adelay lead-in absorbs A2DP datapath resume (otherwise swallows start);
     -- apad covers ring/BT buffers at EOS.  AirPods Pro need a longer lead-in
@@ -1996,15 +2004,24 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     -- :all=1 is required because the input may be stereo: without it adelay
     -- would delay only channel 0 and -ac 1 would mix delayed left with
     -- undelayed right, producing a persistent echo.
-    local pipeline = string.format(
+    local tempo = self:_atempoFilterString(self._playback_speed or 1.0)
+        :match('-filter:a%s*"(.-)"') or ""
+    local filters = {}
+    if tempo ~= "" then table.insert(filters, tempo) end
+    table.insert(filters, string.format("adelay=%d:all=1", adelay_ms))
+    local volume = self:_volumeFilterPart()
+    if volume ~= "" then table.insert(filters, volume:sub(2)) end
+    table.insert(filters, string.format("apad=pad_dur=%.1f", apad_s))
+
+        local pipeline = string.format(
         "%s -loglevel error -progress '%s' -nostats -ss %.3f -i '%s'"
         .. " -f s16le -ar 22050 -ac 1"
-        .. " -af adelay=%d:all=1%s,apad=pad_dur=%.1f - 2>/dev/null"
+        .. " -af '%s' - 2>/dev/null"
         .. " | %s %s"
         .. " ! '%s'"
         .. " ! mixersink stream-type=Music sync=true",
         ffmpeg:gsub("'", "'\\''"), progress_file:gsub("'", "'\\''"), seek,
-        self.current_path:gsub("'", "'\\''"), adelay_ms, self:_volumeFilterPart(), apad_s,
+        self.current_path:gsub("'", "'\\''"), table.concat(filters, ","),
         gst_cmd, fdsrc_args, raw_caps)
     -- out_time is the PRODUCER side: it leads what the listener hears by the
     -- whole downstream buffer -- OS pipe (~1.5 s when full) + gst/mixersink
@@ -2013,7 +2030,7 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     logger.warn("MediaEngine: system gst-launch (ffmpeg stream) gen=", gen,
         "seek_offset=", seek, "progress=", progress_file,
         "apple_airpods=", apple and "yes" or "no",
-        "adelay_ms=", adelay_ms)
+        "adelay_ms=", adelay_ms, "speed=", self._playback_speed or 1.0)
 
     -- setsid: the wrapper shell becomes a process-group leader so stop()'s
     -- kill(-pid) takes down ffmpeg AND gst-launch; without it the pipeline
@@ -3480,8 +3497,14 @@ function MediaEngine:getPosition()
     if self._use_progress_position then
         local ot = self:_readLastOutTime()
         if ot then
-            return (self._seek_offset or 0)
-                + math.max(0, ot - (self._progress_adelay_s or 0))
+            local decoded_s = math.max(0, ot - (self._progress_adelay_s or 0))
+            local pos = (self._seek_offset or 0)
+                + decoded_s * (self._playback_speed or 1.0)
+            -- ffmpeg writes progress periodically.  Never let a late/stale
+            -- sample move the visible or restart position backwards.
+            pos = math.max(pos, self._last_progress_position or pos)
+            self._last_progress_position = pos
+            return pos
         end
         -- No numeric out_time yet.  Hold at seek_offset during the brief
         -- intro/startup (mirrors the iPad sitting on the first line until
@@ -3581,6 +3604,29 @@ function MediaEngine:setSpeed(speed)
     if speed < 0.5 then speed = 0.5 end
     if speed > 3.0 then speed = 3.0 end
     local old_speed = self._playback_speed or 1.0
+
+    -- Kindle applies atempo only when launching its ffmpeg pipeline.  Use the
+    -- proven pause/resume restart path so a tap takes effect immediately.
+    -- Pause before storing the new speed: getPosition() must calculate the
+    -- resume point using the rate that produced the audio heard so far.
+    if self.backend == self.BACKENDS.KINDLE_GST_PLAY
+        and self.is_playing and not self.is_paused
+        and math.abs(speed - old_speed) >= 0.01 then
+        local resume_pos = self:getPosition()
+        logger.warn("MediaEngine: Kindle speed pause/resume",
+            old_speed, "->", speed, "at", resume_pos)
+        self:pause()
+        -- pause() samples the periodic ffmpeg feed again.  Preserve the most
+        -- recent position already observed by the player if that sample lags.
+        self._paused_position = math.max(
+            tonumber(self._paused_position) or 0,
+            tonumber(resume_pos) or 0)
+        self._seek_offset = self._paused_position
+        self._playback_speed = speed
+        self:resume()
+        return
+    end
+
     self._playback_speed = speed
 
     if self.backend == self.BACKENDS.ANDROID then
@@ -3620,7 +3666,7 @@ function MediaEngine:setSpeed(speed)
             self:seek(pos, "absolute")
         end
     end
-    -- aplay / wav-play / Kindle do not support speed control
+    -- aplay / wav-play / Kindle LIPC do not support speed control
 end
 
 function MediaEngine:getSpeed()
