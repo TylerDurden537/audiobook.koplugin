@@ -80,6 +80,8 @@ function MediaEngine:new(o)
     -- filter in the decode pipeline, so it works without depending on
     -- Amazon's (model-specific) LIPC volume property.  1.0 = unchanged.
     o._volume = 1.0
+    -- Restore last-used playback speed (persisted globally in setSpeed())
+    o._playback_speed = (G_reader_settings and G_reader_settings:readSetting("audiobook_playback_speed")) or 1.0
     return o
 end
 
@@ -3628,6 +3630,11 @@ function MediaEngine:setSpeed(speed)
     end
 
     self._playback_speed = speed
+
+     -- Persist globally so it survives restarts / applies to the next book
+    if G_reader_settings and math.abs(speed - old_speed) >= 0.01 then
+        G_reader_settings:saveSetting("audiobook_playback_speed", speed)
+    end
 
     if self.backend == self.BACKENDS.ANDROID then
         -- MediaPlayer applies the rate live via PlaybackParams (also stored
